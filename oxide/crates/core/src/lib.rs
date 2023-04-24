@@ -1,5 +1,7 @@
 use crate::parser::Extractor;
+use ignore::WalkBuilder;
 use rayon::prelude::*;
+use std::path::Path;
 use std::path::PathBuf;
 use tracing::event;
 
@@ -31,6 +33,83 @@ pub fn parse_candidate_strings_from_files(changed_content: Vec<ChangedContent>) 
     parse_all_blobs(read_all_files(changed_content))
 }
 
+#[derive(Debug, Clone)]
+pub struct ContentPathInfo {
+    pub base: String,
+}
+
+pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
+    WalkBuilder::new(args.base)
+        .hidden(false)
+        .filter_entry(move |entry| {
+            // Skip known ignored folders
+            if entry.file_type().unwrap().is_dir() {
+                return entry
+                    .file_name()
+                    .to_str()
+                    .map(|s| s != ".git")
+                    .unwrap_or(false);
+            }
+
+            is_allowed_content_path(entry.path())
+        })
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_file())
+        .filter_map(|s| {
+            // Convert s to a `String`
+            s.path()
+                .to_path_buf()
+                .as_os_str()
+                .to_str()
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
+pub fn is_git_ignored_content_path(base: &Path, path: &Path) -> bool {
+    !WalkBuilder::new(base)
+        .hidden(false)
+        .build()
+        .filter_map(Result::ok)
+        .any(|e| e.path() == path)
+}
+
+pub fn is_allowed_content_path(path: &Path) -> bool {
+    let binary_extensions = include_str!("fixtures/binary-extensions.txt")
+        .trim()
+        .lines()
+        .collect::<Vec<_>>();
+    let ignored_extensions = include_str!("fixtures/ignored-extensions.txt")
+        .trim()
+        .lines()
+        .collect::<Vec<_>>();
+    let ignored_files = include_str!("fixtures/ignored-files.txt")
+        .trim()
+        .lines()
+        .collect::<Vec<_>>();
+
+    let path = PathBuf::from(path);
+
+    // Skip known ignored files
+    if path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .map(|s| ignored_files.contains(&s))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    // Skip known ignored extensions
+    return path
+        .extension()
+        .map(|s| s.to_str().unwrap_or_default())
+        .map(|ext| !ignored_extensions.contains(&ext) && !binary_extensions.contains(&ext))
+        .unwrap_or(false);
+}
+
 #[tracing::instrument(skip(changed_content))]
 fn read_all_files(changed_content: Vec<ChangedContent>) -> Vec<Vec<u8>> {
     event!(
@@ -42,7 +121,13 @@ fn read_all_files(changed_content: Vec<ChangedContent>) -> Vec<Vec<u8>> {
     changed_content
         .into_par_iter()
         .map(|c| match (c.file, c.content) {
-            (Some(file), None) => std::fs::read(file).unwrap(),
+            (Some(file), None) => match std::fs::read(file) {
+                Ok(content) => content,
+                Err(e) => {
+                    event!(tracing::Level::ERROR, "Failed to read file: {:?}", e);
+                    Default::default()
+                }
+            },
             (None, Some(content)) => content.into_bytes(),
             _ => Default::default(),
         })
