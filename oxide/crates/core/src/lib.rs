@@ -40,7 +40,8 @@ pub struct ContentPathInfo {
 }
 
 pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
-    let paths: Vec<_> = WalkBuilder::new(args.base)
+    let root = args.base;
+    let paths: Vec<_> = WalkBuilder::new(&root)
         .hidden(false)
         .filter_entry(move |entry| {
             // Skip known ignored folders
@@ -76,19 +77,23 @@ pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
         }
     }
 
+    let root = Path::new(&root);
+
     // Convert the groups into glob patterns
     groups
         .iter()
         .flat_map(|(path, extensions)| match extensions.len() {
             0 => None, // This should never happen
             1 => Some(format!(
-                "{}/*.{}",
+                "{}/{}.{}",
                 path.display(),
+                if path == root { "*" } else { "**/*" },
                 extensions.iter().next().unwrap()
             )),
             _ => Some(format!(
-                "{}/*.{{{}}}",
+                "{}/{}.{{{}}}",
                 path.display(),
+                if path == root { "*" } else { "**/*" },
                 extensions
                     .iter()
                     .map(|x| x.to_string())
