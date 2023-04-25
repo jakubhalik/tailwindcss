@@ -1,6 +1,7 @@
 use crate::parser::Extractor;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::event;
@@ -39,7 +40,7 @@ pub struct ContentPathInfo {
 }
 
 pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
-    WalkBuilder::new(args.base)
+    let paths: Vec<_> = WalkBuilder::new(args.base)
         .hidden(false)
         .filter_entry(move |entry| {
             // Skip known ignored folders
@@ -56,13 +57,44 @@ pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
-        .filter_map(|s| {
-            // Convert s to a `String`
-            s.path()
-                .to_path_buf()
-                .as_os_str()
-                .to_str()
-                .map(|s| s.to_string())
+        .collect();
+
+    // Group paths by parent path (folder) and collect all the extensions
+    let mut groups: BTreeMap<PathBuf, BTreeSet<String>> = Default::default();
+    for path in &paths {
+        if let Some(parent) = path.path().parent() {
+            let extension = path
+                .path()
+                .extension()
+                .map(|s| s.to_str().unwrap_or_default().to_string())
+                .unwrap_or_default();
+
+            groups
+                .entry(parent.to_path_buf())
+                .or_insert_with(Default::default)
+                .insert(extension);
+        }
+    }
+
+    // Convert the groups into glob patterns
+    groups
+        .iter()
+        .flat_map(|(path, extensions)| match extensions.len() {
+            0 => None, // This should never happen
+            1 => Some(format!(
+                "{}/*.{}",
+                path.display(),
+                extensions.iter().next().unwrap()
+            )),
+            _ => Some(format!(
+                "{}/*.{{{}}}",
+                path.display(),
+                extensions
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
         })
         .collect()
 }
