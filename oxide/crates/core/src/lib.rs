@@ -1,7 +1,7 @@
 use crate::parser::Extractor;
+use fxhash::FxHashSet;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 use tracing::event;
@@ -39,8 +39,37 @@ pub struct ContentPathInfo {
     pub base: String,
 }
 
+// Goals:
+//
+// 1. Recursively watch all top-level folders but not the root folders.
+// 2. Watch files in root directly.
+// 3. Watch files in the `public` folder directly (and don't watch the `public` folder itself).
+// 4. Always watch a common set of known file extensions
+//    (js,jsx,ts,tsx,html,php,vue,svelte,astro,md,mdx,...).
+// 5. Merge known list of file extensions with discovered file extensions in the project (marko).
+
 pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
-    let root = args.base;
+    let root = Path::new(&args.base);
+
+    // A list of direct folder names where we can't use globs, but we should track each file individually instead.
+    // This is because these folders are often used for "src" and also "dist" like files.
+    let static_direct_folder_indentifiers = vec!["public"];
+
+    // A list of known extensions + a list of extensions we found in the project.
+    let mut found_extensions = FxHashSet::from_iter(
+        include_str!("fixtures/wanted-extensions.txt")
+            .trim()
+            .lines(),
+    );
+
+    // A list of direct folders, from the root, where we can use globs to watch all files.
+    let mut direct_folders = FxHashSet::default();
+
+    // A list of static files that we should track directly.
+    let mut static_files = vec![];
+
+    // Collect all valid paths from the root. This will already filter out ignored files, unknown
+    // extensions and binary files.
     let paths: Vec<_> = WalkBuilder::new(&root)
         .hidden(false)
         .filter_entry(move |entry| {
@@ -57,51 +86,74 @@ pub fn resolve_content_paths(args: ContentPathInfo) -> Vec<String> {
         })
         .build()
         .filter_map(Result::ok)
-        .filter(|e| e.path().is_file())
         .collect();
 
-    // Group paths by parent path (folder) and collect all the extensions
-    let mut groups: BTreeMap<PathBuf, BTreeSet<String>> = Default::default();
     for path in &paths {
-        if let Some(parent) = path.path().parent() {
-            let extension = path
-                .path()
-                .extension()
-                .map(|s| s.to_str().unwrap_or_default().to_string())
-                .unwrap_or_default();
+        let path = path.path();
 
-            groups
-                .entry(parent.to_path_buf())
-                .or_insert_with(Default::default)
-                .insert(extension);
+        // If the `path` is a directory, and a direct child of the root and most importantly not a
+        // special cased direct folder (like `public`), then we can track the current folder and
+        // setup globs later.
+        if path.is_dir()
+            && path.parent().map(|parent| parent == root).unwrap_or(false)
+            && !static_direct_folder_indentifiers
+                .iter()
+                .any(|p| root.join(p) == path)
+        {
+            direct_folders.insert(path);
+        }
+
+        if let Some(parent) = path.parent() {
+            // Collect the extension for future use when building globs.
+            if let Some(extension) = path.extension() {
+                found_extensions.insert(extension.to_str().unwrap_or_default());
+            }
+
+            if path.is_file() {
+                // If the parent of the current file is the root folder, then we have to track the
+                // current file directly.
+                if parent == root {
+                    static_files.push(format!("{}", path.display()));
+                    continue;
+                }
+
+                // If the current file is located in one of the direct folders seen from the root,
+                // then we have to track the current file directly.
+                if static_direct_folder_indentifiers
+                    .iter()
+                    .any(|p| parent.starts_with(root.join(p)))
+                {
+                    static_files.push(format!("{}", path.display()));
+                }
+            }
         }
     }
 
-    let root = Path::new(&root);
-
-    // Convert the groups into glob patterns
-    groups
+    let globs = direct_folders
         .iter()
-        .flat_map(|(path, extensions)| match extensions.len() {
-            0 => None, // This should never happen
-            1 => Some(format!(
-                "{}/{}.{}",
-                path.display(),
-                if path == root { "*" } else { "**/*" },
-                extensions.iter().next().unwrap()
-            )),
-            _ => Some(format!(
-                "{}/{}.{{{}}}",
-                path.display(),
-                if path == root { "*" } else { "**/*" },
-                extensions
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
+        .flat_map(|path| {
+            match found_extensions.len() {
+                0 => None, // This should never happen
+                1 => Some(format!(
+                    "{}/**/*.{}",
+                    path.display(),
+                    found_extensions.iter().next().unwrap()
+                )),
+                _ => Some(format!(
+                    "{}/**/*.{{{}}}",
+                    path.display(),
+                    found_extensions
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )),
+            }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    static_files.extend(globs);
+    static_files
 }
 
 pub fn is_git_ignored_content_path(base: &Path, path: &Path) -> bool {
